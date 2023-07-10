@@ -7,7 +7,7 @@ repository = "https://github.com/hroi/fraggen/"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-apollo-parser = "0.5.3"
+apollo-compiler = "0.10.0"
 clap = { version = "4.3.11", features = ["derive"] }
 color-eyre = "0.6.2"
 eyre = "0.6.8"

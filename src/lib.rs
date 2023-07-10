@@ -1,15 +1,11 @@
-use apollo_parser::{
-    ast::{
-        ArgumentsDefinition, Definition, Document, FieldsDefinition, ImplementsInterfaces,
-        InputFieldsDefinition, InputObjectTypeDefinition, InterfaceTypeDefinition, NamedType,
-        ObjectTypeDefinition, Type, UnionTypeDefinition,
+use apollo_compiler::{
+    hir::{
+        ArgumentsDefinition, FieldDefinition, ImplementsInterface, InputValueDefinition,
+        InterfaceTypeDefinition, ObjectTypeDefinition, UnionTypeDefinition,
     },
-    SyntaxTree,
+    ApolloCompiler, HirDatabase,
 };
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::prelude::*,
-};
+use std::{collections::HashSet, io::prelude::*};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -17,24 +13,11 @@ pub enum FragmentGeneratorError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Parse error at index {0}: \"{1}\", {2}")]
-    Parse(usize, String, String),
+    #[error("Parse error: {0}")]
+    Parse(String),
 
     #[error("Schema error: {0}")]
     Schema(&'static str),
-}
-
-struct FragmentGenerator<W: Write> {
-    syntax_tree: Document,
-    output: W,
-
-    resolved: HashMap<String, Vec<String>>,
-    scalar_type_names: HashSet<String>,
-
-    prefix: String,
-    suffix: String,
-
-    add_typename: bool,
 }
 
 pub fn generate<W: Write>(
@@ -44,421 +27,213 @@ pub fn generate<W: Write>(
     suffix: &str,
     add_typename: bool,
 ) -> Result<(), FragmentGeneratorError> {
-    let parser = apollo_parser::Parser::new(schema_content);
-    let ast = parser.parse();
-    if let Some(err) = ast.errors().next() {
-        return Err(FragmentGeneratorError::Parse(
-            err.index(),
-            err.data().into(),
-            err.message().into(),
-        ));
+    let mut compiler = apollo_compiler::ApolloCompiler::new();
+    compiler.add_document(schema_content, "schema.graphql");
+    let diagnostics = compiler.validate();
+    for diagnostic in diagnostics {
+        if diagnostic.data.is_error() {
+            return Err(FragmentGeneratorError::Parse(format!("{}", diagnostic)));
+        }
     }
 
-    FragmentGenerator::new(ast, output, prefix, suffix, add_typename).execute()
+    FragmentGenerator::new(compiler, output, prefix, suffix, add_typename).execute()
+}
+
+struct FragmentGenerator<W: Write> {
+    compiler: ApolloCompiler,
+    output: W,
+    prefix: String,
+    suffix: String,
+    add_typename: bool,
 }
 
 impl<W: Write> FragmentGenerator<W> {
-    fn new(ast: SyntaxTree, output: W, prefix: &str, suffix: &str, add_typename: bool) -> Self {
+    fn new(
+        compiler: ApolloCompiler,
+        output: W,
+        prefix: &str,
+        suffix: &str,
+        add_typename: bool,
+    ) -> Self {
         Self {
-            syntax_tree: ast.document(),
+            compiler,
             output,
-            resolved: HashMap::new(),
-            scalar_type_names: HashSet::from([
-                "Int".into(),
-                "Float".into(),
-                "String".into(),
-                "ID".into(),
-                "Boolean".into(),
-            ]),
-            prefix: prefix.into(),
-            suffix: suffix.into(),
+            prefix: prefix.to_string(),
+            suffix: suffix.to_string(),
             add_typename,
         }
     }
 
     fn execute(&mut self) -> Result<(), FragmentGeneratorError> {
-        let mut enum_typedefs = Vec::new();
-        let mut scalar_typedefs = Vec::new();
-        let mut iface_typedefs = VecDeque::new();
-        let mut union_typedefs = Vec::new();
-        let mut obj_typedefs = Vec::new();
-        let mut input_obj_typedefs = Vec::new();
+        let type_system = self.compiler.db.type_system();
 
-        for def in self.syntax_tree.definitions() {
-            use Definition::*;
-            match def {
-                EnumTypeDefinition(typedef) => enum_typedefs.push(typedef),
-                ScalarTypeDefinition(typedef) => scalar_typedefs.push(typedef),
-                InterfaceTypeDefinition(typedef) => iface_typedefs.push_back(typedef),
-                UnionTypeDefinition(typedef) => union_typedefs.push(typedef),
-                ObjectTypeDefinition(typedef) => obj_typedefs.push(typedef),
-                InputObjectTypeDefinition(typedef) => input_obj_typedefs.push(typedef),
-                _ => (),
-            }
+        for (_name, typedef) in type_system.definitions.interfaces.iter() {
+            self.write_interface_fragment(typedef)?;
+            writeln!(self.output)?;
         }
 
-        // 1. enum types
-
-        for enum_typedef in enum_typedefs {
-            let type_name = enum_typedef
-                .name()
-                .ok_or(FragmentGeneratorError::Schema("scalar has no name"))?
-                .text()
-                .to_string();
-            self.scalar_type_names.insert(type_name);
+        for (_name, typedef) in type_system
+            .definitions
+            .objects
+            .iter()
+            .filter(|(_, typedef)| !typedef.is_introspection())
+        {
+            self.write_object_fragment(typedef)?;
+            writeln!(self.output)?;
         }
 
-        // 2. scalar types
-
-        for scalar_typedef in scalar_typedefs {
-            let type_name = scalar_typedef
-                .name()
-                .ok_or(FragmentGeneratorError::Schema("scalar has no name"))?
-                .text()
-                .to_string();
-            self.scalar_type_names.insert(type_name);
-        }
-
-        // 3. interface types
-
-        let mut recursions = 0;
-        'outer: while let Some(iface_typedef) = iface_typedefs.pop_front() {
-            let Some(implements_interfaces) = iface_typedef.implements_interfaces() else {
-                self.write_interface_fragment(&iface_typedef)?;
-                continue;
-            };
-            for implements_interface in implements_interfaces.named_types() {
-                let type_name = implements_interface
-                    .name()
-                    .ok_or(FragmentGeneratorError::Schema("named type has no name"))?
-                    .text();
-                if !self.resolved.contains_key(type_name.as_str()) {
-                    recursions += 1;
-                    if recursions > iface_typedefs.capacity() {
-                        return Err(FragmentGeneratorError::Schema(
-                            "recursion limit reached while resolving interface hierarchy",
-                        ));
-                    }
-                    iface_typedefs.push_back(iface_typedef);
-                    continue 'outer;
-                }
-            }
-            self.write_interface_fragment(&iface_typedef)?;
-        }
-
-        // 4. Union types
-
-        union_typedefs.sort_by(|a, b| {
-            a.name()
-                .map(|name| name.text())
-                .cmp(&b.name().map(|name| name.text()))
-        });
-
-        for union_typedef in union_typedefs {
-            self.write_union_fragment(&union_typedef)?;
-        }
-
-        // 5. object types
-
-        obj_typedefs.sort_by(|a, b| {
-            a.name()
-                .map(|name| name.text())
-                .cmp(&b.name().map(|name| name.text()))
-        });
-
-        for obj_typedef in obj_typedefs {
-            self.write_object_fragment(&obj_typedef)?;
-        }
-
-        // 6. Input object types
-
-        input_obj_typedefs.sort_by(|a, b| {
-            a.name()
-                .map(|name| name.text())
-                .cmp(&b.name().map(|name| name.text()))
-        });
-
-        for input_obj_typedef in input_obj_typedefs {
-            self.write_input_object_fragment(&input_obj_typedef)?;
+        for (_name, typedef) in type_system.definitions.unions.iter() {
+            self.write_union_fragment(typedef)?;
+            writeln!(self.output)?;
         }
 
         Ok(())
-    }
-
-    fn inherited_fields(
-        &self,
-        implements_interfaces: Option<ImplementsInterfaces>,
-    ) -> Result<HashSet<String>, FragmentGeneratorError> {
-        let mut ret = HashSet::new();
-
-        let Some(implements_interfaces) = implements_interfaces else {
-            return Ok(ret);
-        };
-
-        for named_type in implements_interfaces.named_types() {
-            let type_name = named_type
-                .name()
-                .ok_or(FragmentGeneratorError::Schema("named type has no name"))?;
-            let type_name = type_name.text();
-            let fields =
-                self.resolved
-                    .get(type_name.as_str())
-                    .ok_or(FragmentGeneratorError::Schema(
-                        "couldn't resolve implemented interface type",
-                    ))?;
-            for field in fields {
-                ret.insert(field.clone());
-            }
-        }
-
-        Ok(ret)
-    }
-
-    fn fragment_name(&self, type_name: &str) -> String {
-        format!("{}{}{}", self.prefix, type_name, self.suffix)
     }
 
     fn write_interface_fragment(
         &mut self,
         typedef: &InterfaceTypeDefinition,
     ) -> Result<(), FragmentGeneratorError> {
-        let type_name = &typedef
-            .name()
-            .ok_or(FragmentGeneratorError::Schema("interface type has no name"))?
-            .text()
-            .to_string();
-        let fragment_name = self.fragment_name(type_name);
-        writeln!(self.output, "fragment {fragment_name} on {type_name} {{")?;
-
-        if let Some(implements_interfaces) = typedef.implements_interfaces() {
-            for named_type in implements_interfaces.named_types() {
-                let inherited_type_name = named_type
-                    .name()
-                    .ok_or(FragmentGeneratorError::Schema("named type has no name"))?
-                    .text();
-                let fragment_name = self.fragment_name(&inherited_type_name);
-                writeln!(self.output, "  ...{fragment_name}")?;
-            }
-        }
-
-        let own_fields =
-            self.write_fields(typedef.fields_definition(), typedef.implements_interfaces())?;
-        self.resolved.insert(type_name.clone(), own_fields);
-
-        writeln!(self.output, "}}")?;
-        writeln!(self.output)?;
-        Ok(())
-    }
-
-    fn write_union_fragment(
-        &mut self,
-        typedef: &UnionTypeDefinition,
-    ) -> Result<(), FragmentGeneratorError> {
-        let type_name = &typedef
-            .name()
-            .ok_or(FragmentGeneratorError::Schema("interface type has no name"))?
-            .text()
-            .to_string();
-        let fragment_name = self.fragment_name(type_name);
-        writeln!(self.output, "fragment {fragment_name} on {type_name} {{")?;
-
-        let union_member_types = typedef
-            .union_member_types()
-            .ok_or(FragmentGeneratorError::Schema("union has no members"))?;
-        for named_type in union_member_types.named_types() {
-            let type_name = named_type
-                .name()
-                .ok_or(FragmentGeneratorError::Schema("named type has no name"))?
-                .text();
-            let fragment_name = self.fragment_name(type_name.as_str());
-            writeln!(self.output, "  ... on {type_name} {{")?;
-            writeln!(self.output, "    ...{fragment_name} {{")?;
-            writeln!(self.output, "  }}")?;
-        }
-
-        writeln!(self.output, "}}")?;
-        writeln!(self.output)?;
-        Ok(())
+        self.write_fragment(
+            typedef.name(),
+            typedef.implements_interfaces(),
+            typedef.fields(),
+        )
     }
 
     fn write_object_fragment(
         &mut self,
         typedef: &ObjectTypeDefinition,
     ) -> Result<(), FragmentGeneratorError> {
-        let type_name = typedef
-            .name()
-            .ok_or(FragmentGeneratorError::Schema("object type has no name"))?
-            .text();
-        let fragment_name = self.fragment_name(&type_name);
-        writeln!(self.output, "fragment {fragment_name} on {type_name} {{")?;
-        if self.add_typename {
-            writeln!(self.output, "  __typename")?;
-        }
-
-        if let Some(implements_interfaces) = typedef.implements_interfaces() {
-            for named_type in implements_interfaces.named_types() {
-                let inherited_type_name = named_type
-                    .name()
-                    .ok_or(FragmentGeneratorError::Schema("named type has no name"))?
-                    .text();
-                let fragment_name = self.fragment_name(&inherited_type_name);
-                writeln!(self.output, "  ...{fragment_name}")?;
-            }
-        }
-
-        let own_fields =
-            self.write_fields(typedef.fields_definition(), typedef.implements_interfaces())?;
-        self.resolved.insert(type_name.into(), own_fields);
-
-        writeln!(self.output, "}}")?;
-        writeln!(self.output)?;
-        Ok(())
+        self.write_fragment(
+            typedef.name(),
+            typedef.implements_interfaces(),
+            typedef.fields(),
+        )
     }
 
-    fn write_input_object_fragment(
+    fn write_union_fragment(
         &mut self,
-        typedef: &InputObjectTypeDefinition,
+        typedef: &UnionTypeDefinition,
     ) -> Result<(), FragmentGeneratorError> {
-        let type_name = typedef
-            .name()
-            .ok_or(FragmentGeneratorError::Schema("object type has no name"))?
-            .text();
-        let fragment_name = self.fragment_name(&type_name);
+        let type_name = typedef.name();
+        let fragment_name = self.fragment_name(type_name);
+        writeln!(self.output, "fragment {fragment_name} on {type_name} {{")?;
+        for member in typedef.members() {
+            let member_name = member.name();
+            let fragment_name = self.fragment_name(member_name);
+            writeln!(self.output, "  ... on {member_name} {{")?;
+            writeln!(self.output, "    ...{fragment_name}")?;
+            writeln!(self.output, "  }}")?;
+        }
+        writeln!(self.output, "}}")?;
+        Ok(())
+    }
+
+    fn write_fragment<'a>(
+        &mut self,
+        type_name: &'a str,
+        implements_interfaces: impl Iterator<Item = &'a ImplementsInterface>,
+        fields: impl Iterator<Item = &'a FieldDefinition>,
+    ) -> Result<(), FragmentGeneratorError> {
+        let fragment_name = self.fragment_name(type_name);
         writeln!(self.output, "fragment {fragment_name} on {type_name} {{")?;
         if self.add_typename {
             writeln!(self.output, "  __typename")?;
         }
 
-        let own_fields = self.write_input_fields(typedef.input_fields_definition())?;
-        self.resolved.insert(type_name.into(), own_fields);
-
-        writeln!(self.output, "}}")?;
-        writeln!(self.output)?;
-        Ok(())
-    }
-
-    fn write_input_fields(
-        &mut self,
-        fields_definition: Option<InputFieldsDefinition>,
-    ) -> Result<Vec<String>, FragmentGeneratorError> {
-        let mut own_fields = Vec::new();
-        let fields_definition = fields_definition
-            .ok_or(FragmentGeneratorError::Schema("input object has no fields"))?;
-        for field_definition in fields_definition.input_value_definitions() {
-            let field_name = field_definition
-                .name()
-                .ok_or(FragmentGeneratorError::Schema("field has no name"))?
-                .text();
-            let ty = field_definition
-                .ty()
-                .ok_or(FragmentGeneratorError::Schema("field has no type"))?;
-            self.write_field(&field_name, ty, None)?;
-            own_fields.push(field_name.to_string());
+        let mut inherited_fields = HashSet::new();
+        for implements_interface in implements_interfaces {
+            let interface_typedef = implements_interface
+                .interface_definition(&self.compiler.db)
+                .ok_or(FragmentGeneratorError::Schema(
+                    "implemented interface could not be resolved",
+                ))?;
+            inherited_fields.extend(interface_typedef.fields().map(|f| f.name().to_string()));
+            let interface_name = implements_interface.interface();
+            let fragment_name = self.fragment_name(interface_name);
+            writeln!(self.output, "  ...{fragment_name}")?;
         }
-        Ok(own_fields)
-    }
 
-    fn write_fields(
-        &mut self,
-        fields_definition: Option<FieldsDefinition>,
-        implements_interfaces: Option<ImplementsInterfaces>,
-    ) -> Result<Vec<String>, FragmentGeneratorError> {
-        let fields_definition =
-            fields_definition.ok_or(FragmentGeneratorError::Schema("type has no fields"))?;
-        let inherited_fields = self.inherited_fields(implements_interfaces)?;
-        let mut own_fields = Vec::new();
-        for field_definition in fields_definition.field_definitions() {
-            let field_name = field_definition
-                .name()
-                .ok_or(FragmentGeneratorError::Schema("field has no name"))?
-                .text();
-            let is_inherited = inherited_fields.contains(field_name.as_str());
-            if is_inherited {
+        for field in fields {
+            use apollo_compiler::hir::Type::*;
+            let field_name = field.name();
+            if inherited_fields.contains(field_name) {
                 continue;
-            }
-            let ty = field_definition
-                .ty()
-                .ok_or(FragmentGeneratorError::Schema("field has no type"))?;
-            self.write_field(&field_name, ty, field_definition.arguments_definition())?;
-            own_fields.push(field_name.to_string());
-            // }
-        }
-        Ok(own_fields)
-    }
-
-    fn write_field(
-        &mut self,
-        field_name: &str,
-        mut ty: Type,
-        arguments_definition: Option<ArgumentsDefinition>,
-    ) -> Result<(), FragmentGeneratorError> {
-        loop {
-            match ty {
-                Type::NamedType(named_type) => {
-                    return self.write_field_with_named_type(
-                        field_name,
-                        named_type,
-                        arguments_definition,
-                    );
-                }
-                Type::ListType(list_type) => {
-                    ty = list_type
-                        .ty()
-                        .ok_or(FragmentGeneratorError::Schema("list has no type"))?;
-                }
-                Type::NonNullType(non_null_type) => {
-                    if let Some(list_type) = non_null_type.list_type() {
-                        ty = list_type
-                            .ty()
-                            .ok_or(FragmentGeneratorError::Schema("list has no type"))?;
-                        continue;
-                    }
-                    let named_type = non_null_type
-                        .named_type()
-                        .ok_or(FragmentGeneratorError::Schema("non-null has no named type"))?;
-                    return self.write_field_with_named_type(
-                        field_name,
-                        named_type,
-                        arguments_definition,
-                    );
+            };
+            let mut field_type = field.ty();
+            loop {
+                match field_type {
+                    NonNull { ty, loc: _ } => field_type = ty,
+                    List { ty, loc: _ } => field_type = ty,
+                    _ => break,
                 }
             }
+            let field_type_definition = field_type
+                .type_def(&self.compiler.db)
+                .ok_or(FragmentGeneratorError::Schema("unresolved field type"))?;
+
+            use apollo_compiler::hir::TypeDefinition::*;
+            match field_type_definition {
+                EnumTypeDefinition(_) | ScalarTypeDefinition(_) => {
+                    self.write_simple_field(field_name, field.arguments())?
+                }
+                ObjectTypeDefinition(ref typedef) => {
+                    self.write_complex_field(field_name, typedef, field.arguments())?
+                }
+                InterfaceTypeDefinition(_) | UnionTypeDefinition(_) => {
+                    let fragment_name = self.fragment_name(&field_type.name());
+                    writeln!(self.output, "  # {field_name} {{")?;
+                    writeln!(self.output, "  # ...{fragment_name}")?;
+                    writeln!(self.output, "  # }}")?;
+                }
+                other => {
+                    dbg!(other);
+                    Err(FragmentGeneratorError::Schema("unsupported field type"))?
+                }
+            };
         }
-    }
-
-    fn write_field_with_named_type(
-        &mut self,
-        field_name: &str,
-        named_type: NamedType,
-        arguments_definition: Option<ArgumentsDefinition>,
-    ) -> Result<(), FragmentGeneratorError> {
-        let type_name = named_type
-            .name()
-            .ok_or(FragmentGeneratorError::Schema("named type has no name"))?
-            .text();
-
-        let arglist = if let Some(arguments_definition) = arguments_definition {
-            let mut args = Vec::new();
-            for input_value_definition in arguments_definition.input_value_definitions() {
-                let arg_name = input_value_definition
-                    .name()
-                    .ok_or(FragmentGeneratorError::Schema("argument has no name"))?
-                    .text();
-                args.push(format!("{arg_name}: ${arg_name}"));
-            }
-            format!("({})", args.join(", "))
-        } else {
-            String::new()
-        };
-
-        if self.scalar_type_names.contains(type_name.as_str()) {
-            writeln!(self.output, "  {field_name}{arglist}")?;
-        } else {
-            let fragment_name = self.fragment_name(&type_name);
-            writeln!(self.output, "  # {field_name}{arglist} {{")?;
-            writeln!(self.output, "  #   ...{fragment_name}")?;
-            writeln!(self.output, "  # }}")?;
-        }
+        writeln!(self.output, "}}")?;
         Ok(())
+    }
+
+    fn write_simple_field(
+        &mut self,
+        field_name: &str,
+        arguments: &ArgumentsDefinition,
+    ) -> Result<(), FragmentGeneratorError> {
+        let arglist = Self::format_arglist(arguments.input_values());
+        writeln!(self.output, "  {field_name}{arglist}")?;
+        Ok(())
+    }
+
+    fn write_complex_field(
+        &mut self,
+        field_name: &str,
+        field_typedef: &ObjectTypeDefinition,
+        arguments: &ArgumentsDefinition,
+    ) -> Result<(), FragmentGeneratorError> {
+        let fragment_name = self.fragment_name(field_typedef.name());
+        let arglist = Self::format_arglist(arguments.input_values());
+        writeln!(self.output, "  # {field_name}{arglist} {{")?;
+        writeln!(self.output, "  # ...{fragment_name}")?;
+        writeln!(self.output, "  # }}")?;
+        Ok(())
+    }
+
+    fn fragment_name(&self, type_name: &str) -> String {
+        format!("{}{}{}", self.prefix, type_name, self.suffix)
+    }
+
+    fn format_arglist(input_values: &[InputValueDefinition]) -> String {
+        if input_values.is_empty() {
+            String::new()
+        } else {
+            let args: Vec<String> = input_values
+                .iter()
+                .map(|arg| format!("{0}: ${0}", arg.name()))
+                .collect();
+            format!("({})", args.join(", "))
+        }
     }
 }
