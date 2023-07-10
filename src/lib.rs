@@ -148,17 +148,35 @@ impl<W: Write> FragmentGenerator<W> {
 
         // 4. Union types
 
+        union_typedefs.sort_by(|a, b| {
+            a.name()
+                .map(|name| name.text())
+                .cmp(&b.name().map(|name| name.text()))
+        });
+
         for union_typedef in union_typedefs {
             self.write_union_fragment(&union_typedef)?;
         }
 
         // 5. object types
 
+        obj_typedefs.sort_by(|a, b| {
+            a.name()
+                .map(|name| name.text())
+                .cmp(&b.name().map(|name| name.text()))
+        });
+
         for obj_typedef in obj_typedefs {
             self.write_object_fragment(&obj_typedef)?;
         }
 
         // 6. Input object types
+
+        input_obj_typedefs.sort_by(|a, b| {
+            a.name()
+                .map(|name| name.text())
+                .cmp(&b.name().map(|name| name.text()))
+        });
 
         for input_obj_typedef in input_obj_typedefs {
             self.write_input_object_fragment(&input_obj_typedef)?;
