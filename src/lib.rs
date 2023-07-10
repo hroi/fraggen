@@ -5,8 +5,27 @@ use apollo_compiler::{
     },
     ApolloCompiler, HirDatabase,
 };
-use std::{collections::HashSet, io::prelude::*};
+use std::{collections::HashSet, io::prelude::*, result};
 use thiserror::Error;
+
+pub fn generate<W: Write>(
+    schema_content: &str,
+    output: W,
+    prefix: &str,
+    suffix: &str,
+    add_typename: bool,
+) -> FraggenResult {
+    let mut compiler = apollo_compiler::ApolloCompiler::new();
+    compiler.add_type_system(schema_content, "schema.graphql");
+    let diagnostics = compiler.validate();
+    for diagnostic in diagnostics {
+        if diagnostic.data.is_error() {
+            return Err(FragmentGeneratorError::Parse(format!("{}", diagnostic)));
+        }
+    }
+
+    FragmentGenerator::new(compiler, output, prefix, suffix, add_typename).execute()
+}
 
 #[derive(Error, Debug)]
 pub enum FragmentGeneratorError {
@@ -20,24 +39,7 @@ pub enum FragmentGeneratorError {
     Schema(&'static str),
 }
 
-pub fn generate<W: Write>(
-    schema_content: &str,
-    output: W,
-    prefix: &str,
-    suffix: &str,
-    add_typename: bool,
-) -> Result<(), FragmentGeneratorError> {
-    let mut compiler = apollo_compiler::ApolloCompiler::new();
-    compiler.add_document(schema_content, "schema.graphql");
-    let diagnostics = compiler.validate();
-    for diagnostic in diagnostics {
-        if diagnostic.data.is_error() {
-            return Err(FragmentGeneratorError::Parse(format!("{}", diagnostic)));
-        }
-    }
-
-    FragmentGenerator::new(compiler, output, prefix, suffix, add_typename).execute()
-}
+type FraggenResult = result::Result<(), FragmentGeneratorError>;
 
 struct FragmentGenerator<W: Write> {
     compiler: ApolloCompiler,
@@ -64,61 +66,48 @@ impl<W: Write> FragmentGenerator<W> {
         }
     }
 
-    fn execute(&mut self) -> Result<(), FragmentGeneratorError> {
+    fn execute(&mut self) -> FraggenResult {
         let type_system = self.compiler.db.type_system();
 
-        for (_name, typedef) in type_system.definitions.interfaces.iter() {
-            self.write_interface_fragment(typedef)?;
-            writeln!(self.output)?;
-        }
-
-        for (_name, typedef) in type_system
-            .definitions
-            .objects
-            .iter()
-            .filter(|(_, typedef)| !typedef.is_introspection())
-        {
-            self.write_object_fragment(typedef)?;
-            writeln!(self.output)?;
-        }
-
-        for (_name, typedef) in type_system.definitions.unions.iter() {
-            self.write_union_fragment(typedef)?;
+        for (_name, typedef) in type_system.type_definitions_by_name.iter() {
+            use apollo_compiler::hir::TypeDefinition::*;
+            match typedef {
+                ObjectTypeDefinition(typedef) if !typedef.is_introspection() => {
+                    self.write_object_fragment(typedef)?
+                }
+                InterfaceTypeDefinition(typedef) => self.write_interface_fragment(typedef)?,
+                UnionTypeDefinition(typedef) => self.write_union_fragment(typedef)?,
+                _ => continue,
+            }
             writeln!(self.output)?;
         }
 
         Ok(())
     }
 
-    fn write_interface_fragment(
-        &mut self,
-        typedef: &InterfaceTypeDefinition,
-    ) -> Result<(), FragmentGeneratorError> {
+    fn write_interface_fragment(&mut self, typedef: &InterfaceTypeDefinition) -> FraggenResult {
         self.write_fragment(
             typedef.name(),
             typedef.implements_interfaces(),
             typedef.fields(),
+            false,
         )
     }
 
-    fn write_object_fragment(
-        &mut self,
-        typedef: &ObjectTypeDefinition,
-    ) -> Result<(), FragmentGeneratorError> {
+    fn write_object_fragment(&mut self, typedef: &ObjectTypeDefinition) -> FraggenResult {
         self.write_fragment(
             typedef.name(),
             typedef.implements_interfaces(),
             typedef.fields(),
+            self.add_typename,
         )
     }
 
-    fn write_union_fragment(
-        &mut self,
-        typedef: &UnionTypeDefinition,
-    ) -> Result<(), FragmentGeneratorError> {
+    fn write_union_fragment(&mut self, typedef: &UnionTypeDefinition) -> FraggenResult {
         let type_name = typedef.name();
         let fragment_name = self.fragment_name(type_name);
         writeln!(self.output, "fragment {fragment_name} on {type_name} {{")?;
+
         for member in typedef.members() {
             let member_name = member.name();
             let fragment_name = self.fragment_name(member_name);
@@ -126,6 +115,7 @@ impl<W: Write> FragmentGenerator<W> {
             writeln!(self.output, "    ...{fragment_name}")?;
             writeln!(self.output, "  }}")?;
         }
+
         writeln!(self.output, "}}")?;
         Ok(())
     }
@@ -135,14 +125,16 @@ impl<W: Write> FragmentGenerator<W> {
         type_name: &'a str,
         implements_interfaces: impl Iterator<Item = &'a ImplementsInterface>,
         fields: impl Iterator<Item = &'a FieldDefinition>,
-    ) -> Result<(), FragmentGeneratorError> {
+        add_typename: bool,
+    ) -> FraggenResult {
         let fragment_name = self.fragment_name(type_name);
         writeln!(self.output, "fragment {fragment_name} on {type_name} {{")?;
-        if self.add_typename {
+        if add_typename {
             writeln!(self.output, "  __typename")?;
         }
 
         let mut inherited_fields = HashSet::new();
+
         for implements_interface in implements_interfaces {
             let interface_typedef = implements_interface
                 .interface_definition(&self.compiler.db)
@@ -166,7 +158,7 @@ impl<W: Write> FragmentGenerator<W> {
                 match field_type {
                     NonNull { ty, loc: _ } => field_type = ty,
                     List { ty, loc: _ } => field_type = ty,
-                    _ => break,
+                    Named { name: _, loc: _ } => break,
                 }
             }
             let field_type_definition = field_type
@@ -179,13 +171,13 @@ impl<W: Write> FragmentGenerator<W> {
                     self.write_simple_field(field_name, field.arguments())?
                 }
                 ObjectTypeDefinition(ref typedef) => {
-                    self.write_complex_field(field_name, typedef, field.arguments())?
+                    self.write_complex_field(field_name, typedef.name(), field.arguments())?
                 }
-                InterfaceTypeDefinition(_) | UnionTypeDefinition(_) => {
-                    let fragment_name = self.fragment_name(&field_type.name());
-                    writeln!(self.output, "  # {field_name} {{")?;
-                    writeln!(self.output, "  # ...{fragment_name}")?;
-                    writeln!(self.output, "  # }}")?;
+                InterfaceTypeDefinition(typedef) => {
+                    self.write_complex_field(field_name, typedef.name(), field.arguments())?
+                }
+                UnionTypeDefinition(typedef) => {
+                    self.write_complex_field(field_name, typedef.name(), field.arguments())?
                 }
                 other => {
                     dbg!(other);
@@ -193,6 +185,7 @@ impl<W: Write> FragmentGenerator<W> {
                 }
             };
         }
+
         writeln!(self.output, "}}")?;
         Ok(())
     }
@@ -201,7 +194,7 @@ impl<W: Write> FragmentGenerator<W> {
         &mut self,
         field_name: &str,
         arguments: &ArgumentsDefinition,
-    ) -> Result<(), FragmentGeneratorError> {
+    ) -> FraggenResult {
         let arglist = Self::format_arglist(arguments.input_values());
         writeln!(self.output, "  {field_name}{arglist}")?;
         Ok(())
@@ -210,13 +203,13 @@ impl<W: Write> FragmentGenerator<W> {
     fn write_complex_field(
         &mut self,
         field_name: &str,
-        field_typedef: &ObjectTypeDefinition,
+        type_name: &str,
         arguments: &ArgumentsDefinition,
-    ) -> Result<(), FragmentGeneratorError> {
-        let fragment_name = self.fragment_name(field_typedef.name());
+    ) -> FraggenResult {
+        let fragment_name = self.fragment_name(type_name);
         let arglist = Self::format_arglist(arguments.input_values());
         writeln!(self.output, "  # {field_name}{arglist} {{")?;
-        writeln!(self.output, "  # ...{fragment_name}")?;
+        writeln!(self.output, "  #   ...{fragment_name}")?;
         writeln!(self.output, "  # }}")?;
         Ok(())
     }
