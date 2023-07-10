@@ -1,3 +1,4 @@
+[![Release](https://github.com/hroi/fraggen/actions/workflows/release.yml/badge.svg)](https://github.com/hroi/fraggen/actions/workflows/release.yml)
 # fraggen
 GraphQL fragment generator
 
