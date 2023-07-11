@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-/// Generate fragments for every type in your GraphQL schema
+/// Generate fragments for types in your GraphQL schema
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -24,6 +24,10 @@ struct Cli {
     /// Add __typename to object fragments
     #[arg(long)]
     typename: bool,
+
+    /// Don't print warnings or advice
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 fn main() -> Result<()> {
@@ -39,6 +43,7 @@ fn main() -> Result<()> {
         &args.prefix,
         &args.suffix,
         args.typename,
+        args.quiet,
     )?;
 
     Ok(())

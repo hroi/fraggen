@@ -14,6 +14,7 @@ pub fn generate<W: Write>(
     prefix: &str,
     suffix: &str,
     add_typename: bool,
+    quiet: bool,
 ) -> FraggenResult {
     let mut compiler = apollo_compiler::ApolloCompiler::new();
     compiler.add_type_system(schema_content, "schema.graphql");
@@ -21,6 +22,12 @@ pub fn generate<W: Write>(
     for diagnostic in diagnostics {
         if diagnostic.data.is_error() {
             return Err(FragmentGeneratorError::Parse(format!("{}", diagnostic)));
+        }
+        if !quiet && diagnostic.data.is_warning() {
+            eprintln!("{}", diagnostic);
+        }
+        if !quiet && diagnostic.data.is_advice() {
+            eprintln!("{}", diagnostic);
         }
     }
 
@@ -32,7 +39,7 @@ pub enum FragmentGeneratorError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Parse error: {0}")]
+    #[error("{0}")]
     Parse(String),
 
     #[error("Schema error: {0}")]
@@ -138,55 +145,52 @@ impl<W: Write> FragmentGenerator<W> {
         for implements_interface in implements_interfaces {
             let interface_typedef = implements_interface
                 .interface_definition(&self.compiler.db)
-                .ok_or(FragmentGeneratorError::Schema(
-                    "implemented interface could not be resolved",
-                ))?;
+                .ok_or(FragmentGeneratorError::Schema("unresolved interface"))?;
             inherited_fields.extend(interface_typedef.fields().map(|f| f.name().to_string()));
             let interface_name = implements_interface.interface();
             let fragment_name = self.fragment_name(interface_name);
             writeln!(self.output, "  ...{fragment_name}")?;
         }
 
-        for field in fields {
-            use apollo_compiler::hir::Type::*;
-            let field_name = field.name();
-            if inherited_fields.contains(field_name) {
-                continue;
-            };
-            let mut field_type = field.ty();
-            loop {
-                match field_type {
-                    NonNull { ty, loc: _ } => field_type = ty,
-                    List { ty, loc: _ } => field_type = ty,
-                    Named { name: _, loc: _ } => break,
-                }
-            }
-            let field_type_definition = field_type
-                .type_def(&self.compiler.db)
-                .ok_or(FragmentGeneratorError::Schema("unresolved field type"))?;
-
-            use apollo_compiler::hir::TypeDefinition::*;
-            match field_type_definition {
-                EnumTypeDefinition(_) | ScalarTypeDefinition(_) => {
-                    self.write_simple_field(field_name, field.arguments())?
-                }
-                ObjectTypeDefinition(ref typedef) => {
-                    self.write_complex_field(field_name, typedef.name(), field.arguments())?
-                }
-                InterfaceTypeDefinition(typedef) => {
-                    self.write_complex_field(field_name, typedef.name(), field.arguments())?
-                }
-                UnionTypeDefinition(typedef) => {
-                    self.write_complex_field(field_name, typedef.name(), field.arguments())?
-                }
-                other => {
-                    dbg!(other);
-                    Err(FragmentGeneratorError::Schema("unsupported field type"))?
-                }
-            };
+        for field in fields.filter(|fld| !inherited_fields.contains(fld.name())) {
+            self.write_field(field)?;
         }
 
         writeln!(self.output, "}}")?;
+        Ok(())
+    }
+
+    fn write_field(&mut self, field: &FieldDefinition) -> FraggenResult {
+        use apollo_compiler::hir::Type::*;
+        let field_name = field.name();
+        let mut field_type = field.ty();
+        loop {
+            match field_type {
+                NonNull { ty, loc: _ } => field_type = ty,
+                List { ty, loc: _ } => field_type = ty,
+                Named { name: _, loc: _ } => break,
+            }
+        }
+        let field_type_definition = field_type
+            .type_def(&self.compiler.db)
+            .ok_or(FragmentGeneratorError::Schema("unresolved field type"))?;
+
+        use apollo_compiler::hir::TypeDefinition::*;
+        match field_type_definition {
+            EnumTypeDefinition(_) | ScalarTypeDefinition(_) => {
+                self.write_simple_field(field_name, field.arguments())?
+            }
+            ObjectTypeDefinition(typedef) => {
+                self.write_complex_field(field_name, typedef.name(), field.arguments())?
+            }
+            InterfaceTypeDefinition(typedef) => {
+                self.write_complex_field(field_name, typedef.name(), field.arguments())?
+            }
+            UnionTypeDefinition(typedef) => {
+                self.write_complex_field(field_name, typedef.name(), field.arguments())?
+            }
+            _ => Err(FragmentGeneratorError::Schema("unsupported field type"))?,
+        };
         Ok(())
     }
 
