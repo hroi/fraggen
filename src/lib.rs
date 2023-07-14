@@ -9,9 +9,6 @@ use apollo_compiler::{
 use std::{collections::HashSet, io::prelude::*, result};
 use thiserror::Error;
 
-#[cfg(test)]
-mod tests;
-
 /// # Errors
 /// Will return `Err` if there are errors parsing the schema, types can not be resolved
 /// or a field type is not supported.
