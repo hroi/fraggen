@@ -1,6 +1,6 @@
 [package]
 name = "fraggen"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 repository = "https://github.com/hroi/fraggen/"
 
@@ -25,8 +25,6 @@ lto = "thin"
 [workspace.metadata.dist]
 # The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.14.1"
-# The preferred Rust toolchain to use in CI (rustup toolchain syntax)
-# rust-toolchain-version = "1.67.1"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
