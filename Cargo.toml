@@ -7,11 +7,14 @@ repository = "https://github.com/hroi/fraggen/"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-apollo-compiler = "0.10.0"
-clap = { version = "4.3.11", features = ["derive"] }
-color-eyre = "0.6.2"
-eyre = "0.6.8"
-thiserror = "1.0.43"
+apollo-compiler = "0.11"
+clap = { version = "4.5.4", features = ["derive"] }
+color-eyre = "0.6.3"
+eyre = "0.6.12"
+thiserror = "1.0.61"
+
+[dev-dependencies]
+indoc = "2.0.5"
 
 # The profile that 'cargo dist' will build with
 [profile.dist]
@@ -31,5 +34,3 @@ installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
-[dev-dependencies]
-indoc = "2.0.2"

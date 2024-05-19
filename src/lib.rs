@@ -1,16 +1,13 @@
 use apollo_compiler::hir::{InputObjectTypeDefinition, Type, TypeDefinition};
 use apollo_compiler::{
     hir::{
-        ArgumentsDefinition, FieldDefinition, ImplementsInterface, InputValueDefinition,
-        InterfaceTypeDefinition, ObjectTypeDefinition, UnionTypeDefinition,
+        FieldDefinition, ImplementsInterface, InputValueDefinition, InterfaceTypeDefinition,
+        ObjectTypeDefinition, UnionTypeDefinition,
     },
     ApolloCompiler, HirDatabase,
 };
 use std::{collections::HashSet, io::prelude::*, result};
 use thiserror::Error;
-
-#[cfg(test)]
-mod tests;
 
 /// # Errors
 /// Will return `Err` if there are errors parsing the schema, types can not be resolved
@@ -185,7 +182,6 @@ impl<W: Write> FragmentGenerator<W> {
     }
 
     fn write_field(&mut self, field: &FieldDefinition) -> FraggenResult<()> {
-        let field_name = field.name();
         let mut field_type = field.ty();
 
         while let Type::NonNull { ty, loc: _ } | Type::List { ty, loc: _ } = field_type {
@@ -198,16 +194,16 @@ impl<W: Write> FragmentGenerator<W> {
 
         match field_type_definition {
             TypeDefinition::EnumTypeDefinition(_) | TypeDefinition::ScalarTypeDefinition(_) => {
-                self.write_simple_field(field_name, field.arguments())?;
+                self.write_simple_field(field)?;
             }
             TypeDefinition::ObjectTypeDefinition(typedef) => {
-                self.write_complex_field(field_name, typedef.name(), field.arguments())?;
+                self.write_complex_field(typedef.name(), field)?;
             }
             TypeDefinition::InterfaceTypeDefinition(typedef) => {
-                self.write_complex_field(field_name, typedef.name(), field.arguments())?;
+                self.write_complex_field(typedef.name(), field)?;
             }
             TypeDefinition::UnionTypeDefinition(typedef) => {
-                self.write_complex_field(field_name, typedef.name(), field.arguments())?;
+                self.write_complex_field(typedef.name(), field)?;
             }
             TypeDefinition::InputObjectTypeDefinition(_) => {
                 Err(FragmentGeneratorError::Schema("unsupported field type"))?;
@@ -216,25 +212,41 @@ impl<W: Write> FragmentGenerator<W> {
         Ok(())
     }
 
-    fn write_simple_field(
-        &mut self,
-        field_name: &str,
-        arguments: &ArgumentsDefinition,
-    ) -> FraggenResult<()> {
-        let arglist = self.format_arglist(arguments.input_values(), "  ")?;
-        writeln!(self.output, "  {field_name}{arglist}")?;
+    fn write_simple_field(&mut self, field: &FieldDefinition) -> FraggenResult<()> {
+        let arglist = self.format_arglist(field.arguments().input_values(), "  ")?;
+        let field_name = field.name();
+        if let Some(deprecation) = field.directive_by_name("deprecated") {
+            write!(self.output, "  # {field_name}{arglist}")?;
+            if let Some(reason) = deprecation.argument_by_name("reason") {
+                let reason = reason.as_str().unwrap_or("");
+                writeln!(self.output, " # deprecated: {reason}")?;
+            } else {
+                writeln!(self.output)?;
+            }
+        } else {
+            writeln!(self.output, "  {field_name}{arglist}")?;
+        }
         Ok(())
     }
 
     fn write_complex_field(
         &mut self,
-        field_name: &str,
         type_name: &str,
-        arguments: &ArgumentsDefinition,
+        field: &FieldDefinition,
     ) -> FraggenResult<()> {
+        let field_name = field.name();
         let fragment_name = self.fragment_name(type_name);
-        let arglist = self.format_arglist(arguments.input_values(), "  # ")?;
-        writeln!(self.output, "  # {field_name}{arglist} {{")?;
+        let arglist = self.format_arglist(field.arguments().input_values(), "  # ")?;
+        let mut deprecation_str = String::new();
+        if let Some(deprecation) = field.directive_by_name("deprecated") {
+            if let Some(reason) = deprecation.argument_by_name("reason") {
+                let reason = reason.as_str().unwrap_or("");
+                deprecation_str = format!(" # deprecated: {reason}");
+            } else {
+                deprecation_str = format!(" # deprecated");
+            }
+        }
+        writeln!(self.output, "  # {field_name}{arglist} {{{deprecation_str}")?;
         writeln!(self.output, "  #   ...{fragment_name}")?;
         writeln!(self.output, "  # }}")?;
         Ok(())

@@ -39,7 +39,7 @@ fn test_single_level() {
     "};
 
     let mut output = Vec::new();
-    crate::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
+    fraggen::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
     let fragments = from_utf8(&output).unwrap();
 
     assert_valid(fragments);
@@ -72,7 +72,7 @@ fn test_multilevel() {
     "};
 
     let mut output = Vec::new();
-    crate::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
+    fraggen::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
     let fragments = from_utf8(&output).unwrap();
 
     assert_valid(fragments);
@@ -107,7 +107,7 @@ fn test_implements_interface() {
     "};
 
     let mut output = Vec::new();
-    crate::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
+    fraggen::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
     let fragments = from_utf8(&output).unwrap();
 
     assert_valid(fragments);
@@ -132,7 +132,7 @@ fn test_arguments() {
     "};
 
     let mut output = Vec::new();
-    crate::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
+    fraggen::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
     let fragments = from_utf8(&output).unwrap();
 
     assert_valid(fragments);
@@ -172,7 +172,7 @@ fn test_input() {
     "};
 
     let mut output = Vec::new();
-    crate::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
+    fraggen::generate(&schema, &mut output, "My", "Fields", true, true).unwrap();
     let fragments = from_utf8(&output).unwrap();
 
     assert_valid(fragments);
